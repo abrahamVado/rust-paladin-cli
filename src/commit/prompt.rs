@@ -19,7 +19,8 @@ Required JSON schema:
   "type": "feat",
   "scope": null,
   "subject": "short imperative subject without period",
-  "body": []
+  "body": [],
+  "risk": "medium"
 }}
 
 Rules:
@@ -29,10 +30,20 @@ Rules:
 - "subject" must be under 72 characters.
 - "subject" must not end with a period.
 - "body" must be an array of strings.
+- "risk" must be one of: low, medium, high.
 - Use the summary and file list first.
 - Use the diff preview only for extra context.
 - Some generated or lockfile paths may appear in summaries but be omitted from the diff preview.
 - If this looks like the first project commit, use type "feat" and subject like "add initial project scaffold".
+- The terminal output will be rendered exactly like this:
+  Suggested commit:
+  feat(auth): wire login flow to database
+
+  Body:
+  - validate credentials using stored bcrypt hashes
+  - return an access token after successful authentication
+
+  Risk: medium
 
 Repository context:
 

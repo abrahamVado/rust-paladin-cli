@@ -14,11 +14,23 @@ pub fn print_commit_suggestion(suggestion: &CommitSuggestion, diff_truncated: bo
         }
     }
 
+    println!();
+    println!("{} {}", "Risk:".bold(), color_risk(&suggestion.risk));
+
     if diff_truncated {
         println!();
         println!(
             "{}",
             "Note: diff was truncated before being sent to the model.".yellow()
         );
+    }
+}
+
+fn color_risk(value: &str) -> colored::ColoredString {
+    match value {
+        "low" => value.green(),
+        "medium" => value.yellow(),
+        "high" => value.red().bold(),
+        _ => value.normal(),
     }
 }

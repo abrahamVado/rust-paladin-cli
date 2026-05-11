@@ -9,11 +9,13 @@ pub struct CommitSuggestion {
     pub subject: String,
     #[serde(default)]
     pub body: Vec<String>,
+    pub risk: String,
 }
 
 impl CommitSuggestion {
     pub fn validate(&self) -> Result<()> {
         validate_commit_type(&self.commit_type)?;
+        validate_risk(&self.risk)?;
 
         if self.subject.trim().is_empty() {
             return Err(anyhow!("commit subject is empty"));
@@ -60,5 +62,15 @@ fn validate_commit_type(value: &str) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("invalid commit type: {}", value))
+    }
+}
+
+fn validate_risk(value: &str) -> Result<()> {
+    let allowed = ["low", "medium", "high"];
+
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(anyhow!("invalid risk: {}", value))
     }
 }
