@@ -19,7 +19,7 @@ pub async fn run(args: CommitArgs) -> Result<()> {
         ));
     }
 
-    let prompt = prompt::build_commit_prompt(&changes)?;
+    let prompt = prompt::build_commit_prompt(&changes);
     let client = OllamaClient::new(args.ollama_url.clone(), args.model.clone());
 
     println!("Analyzing Git diff with {}...", args.model);
@@ -31,12 +31,6 @@ pub async fn run(args: CommitArgs) -> Result<()> {
     suggestion.validate()?;
 
     output::print_commit_suggestion(&suggestion, changes.diff_truncated);
-
-    if !suggestion.should_commit {
-        return Err(anyhow!(
-            "model marked this change as not safe to commit automatically"
-        ));
-    }
 
     if !args.yes && !confirm("Create this commit? [y/N] ")? {
         println!("Commit cancelled.");

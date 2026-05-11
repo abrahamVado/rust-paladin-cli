@@ -33,6 +33,6 @@ pub struct CommitArgs {
     pub ollama_url: String,
 
     /// Maximum diff characters sent to the model.
-    #[arg(long, default_value_t = 60_000)]
+    #[arg(long, default_value_t = 20_000)]
     pub max_diff_chars: usize,
 }

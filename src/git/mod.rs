@@ -2,6 +2,31 @@ use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::process::Command;
 
+const EXCLUDED_DIFF_PATHS: &[&str] = &[
+    ":(exclude)Cargo.lock",
+    ":(exclude)package-lock.json",
+    ":(exclude)pnpm-lock.yaml",
+    ":(exclude)yarn.lock",
+    ":(exclude)go.sum",
+    ":(exclude)dist/**",
+    ":(exclude)build/**",
+    ":(exclude)target/**",
+    ":(exclude)node_modules/**",
+    ":(exclude)coverage/**",
+    ":(exclude).next/**",
+    ":(exclude)out/**",
+    ":(exclude)vendor/**",
+    ":(exclude)tmp/**",
+    ":(exclude)temp/**",
+    ":(exclude)storybook-static/**",
+    ":(exclude).turbo/**",
+    ":(exclude).parcel-cache/**",
+    ":(exclude).svelte-kit/**",
+    ":(exclude).nuxt/**",
+    ":(exclude)public/build/**",
+    ":(exclude)bin/**",
+];
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandResult {
     pub command: String,
@@ -14,8 +39,10 @@ pub struct GitChangeSet {
     pub branch: CommandResult,
     pub status_short: CommandResult,
     pub diff_stat: CommandResult,
+    pub diff_numstat: CommandResult,
     pub diff_name_only: CommandResult,
     pub diff: CommandResult,
+    pub skipped_diff_paths: Vec<String>,
 
     /// True when the diff came from staged changes:
     /// git diff --staged
@@ -59,9 +86,15 @@ pub fn collect_changes(staged: bool, max_diff_chars: usize) -> Result<GitChangeS
     let status_short = run_git(&["status", "--short"])?;
 
     let diff_stat = if use_staged {
-        run_git(&["diff", "--staged", "--stat"])?
+        run_git(&["diff", "--staged", "--stat"])? 
     } else {
-        run_git(&["diff", "--stat"])?
+        run_git(&["diff", "--stat"])? 
+    };
+
+    let diff_numstat = if use_staged {
+        run_git(&["diff", "--staged", "--numstat"])?
+    } else {
+        run_git(&["diff", "--numstat"])?
     };
 
     let diff_name_only = if use_staged {
@@ -70,10 +103,10 @@ pub fn collect_changes(staged: bool, max_diff_chars: usize) -> Result<GitChangeS
         run_git(&["diff", "--name-only"])?
     };
 
-    let mut diff = if use_staged {
-        run_git(&["diff", "--staged"])?
+    let (mut diff, skipped_diff_paths) = if use_staged {
+        run_git_filtered_diff(true)?
     } else {
-        run_git(&["diff"])?
+        run_git_filtered_diff(false)?
     };
 
     let diff_truncated = diff.output.chars().count() > max_diff_chars;
@@ -87,8 +120,10 @@ pub fn collect_changes(staged: bool, max_diff_chars: usize) -> Result<GitChangeS
         branch,
         status_short,
         diff_stat,
+        diff_numstat,
         diff_name_only,
         diff,
+        skipped_diff_paths,
         staged: use_staged,
         diff_truncated,
     })
@@ -96,7 +131,7 @@ pub fn collect_changes(staged: bool, max_diff_chars: usize) -> Result<GitChangeS
 
 /// Returns true when Paladin has an actual diff to send to the model.
 pub fn has_changes(changes: &GitChangeSet) -> bool {
-    !changes.diff.output.trim().is_empty()
+    !changes.diff_name_only.output.trim().is_empty()
 }
 
 /// Stages all changes in the repository.
@@ -177,6 +212,72 @@ fn run_git(args: &[&str]) -> Result<CommandResult> {
             Some(stderr)
         },
     })
+}
+
+fn run_git_filtered_diff(staged: bool) -> Result<(CommandResult, Vec<String>)> {
+    let excluded_paths = collect_excluded_paths(staged)?;
+    let mut args = vec!["diff"];
+
+    if staged {
+        args.push("--staged");
+    }
+
+    args.push("--");
+    args.push(".");
+    args.extend(EXCLUDED_DIFF_PATHS.iter().copied());
+
+    let diff = run_git(&args)?;
+
+    Ok((diff, excluded_paths))
+}
+
+fn collect_excluded_paths(staged: bool) -> Result<Vec<String>> {
+    let diff_name_only = if staged {
+        run_git(&["diff", "--staged", "--name-only"])?
+    } else {
+        run_git(&["diff", "--name-only"])?
+    };
+
+    let mut excluded_paths = Vec::new();
+
+    for path in diff_name_only.output.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if should_skip_diff_path(path) {
+            excluded_paths.push(path.to_string());
+        }
+    }
+
+    Ok(excluded_paths)
+}
+
+fn should_skip_diff_path(path: &str) -> bool {
+    path == "Cargo.lock"
+        || path == "package-lock.json"
+        || path == "pnpm-lock.yaml"
+        || path == "yarn.lock"
+        || path == "go.sum"
+        || is_path_in_dir(path, "dist")
+        || is_path_in_dir(path, "build")
+        || is_path_in_dir(path, "target")
+        || is_path_in_dir(path, "node_modules")
+        || is_path_in_dir(path, "coverage")
+        || is_path_in_dir(path, ".next")
+        || is_path_in_dir(path, "out")
+        || is_path_in_dir(path, "vendor")
+        || is_path_in_dir(path, "tmp")
+        || is_path_in_dir(path, "temp")
+        || is_path_in_dir(path, "storybook-static")
+        || is_path_in_dir(path, ".turbo")
+        || is_path_in_dir(path, ".parcel-cache")
+        || is_path_in_dir(path, ".svelte-kit")
+        || is_path_in_dir(path, ".nuxt")
+        || is_path_in_dir(path, "public/build")
+        || is_path_in_dir(path, "bin")
+}
+
+fn is_path_in_dir(path: &str, dir: &str) -> bool {
+    path == dir
+        || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'))
+        || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('\\'))
 }
 
 /// Runs a Git command and fails if Git returns a non-zero status.

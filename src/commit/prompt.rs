@@ -1,64 +1,66 @@
 use crate::git::GitChangeSet;
-use anyhow::Result;
 
-pub fn build_commit_prompt(changes: &GitChangeSet) -> Result<String> {
-    let context = serde_json::to_string_pretty(changes)?;
-
-    Ok(format!(
+pub fn build_commit_prompt(changes: &GitChangeSet) -> String {
+    format!(
         r#"
-You are Paladin, a local Git commit assistant.
+You are a Git commit message generator.
 
-You analyze Git diffs and produce one safe Conventional Commit suggestion.
+Generate ONE conventional commit message for the provided Git changes.
 
-Critical rules:
-- Return ONLY valid JSON.
-- Do not include markdown.
-- Do not include explanations outside JSON.
-- Do not invent files that are not present.
-- Use short, clear commit text.
-- The title must be lower case except proper nouns.
-- The title must NOT end with a period.
-- The body must be a list of concise bullet lines without leading hyphens.
-- Use "should_commit": false if the diff is empty, unclear, dangerous, or looks like secrets.
-- If secrets, credentials, private keys, tokens, or passwords appear in the diff, set "should_commit": false and risk_level "high".
+Return ONLY valid JSON.
+Do NOT return markdown.
+Do NOT explain.
+Do NOT reason.
+Do NOT include a "thought" field.
 
-Allowed commit types:
-- feat
-- fix
-- docs
-- style
-- refactor
-- test
-- chore
-- build
-- ci
-- perf
-- revert
-
-Allowed risk levels:
-- low
-- medium
-- high
-
-Required JSON shape:
+Required JSON schema:
 
 {{
   "type": "feat",
-  "scope": "auth",
-  "title": "wire login flow to database",
-  "body": [
-    "validate credentials using stored bcrypt hashes",
-    "return access tokens after successful authentication"
-  ],
-  "risk_level": "medium",
-  "files": [
-    "internal/modules/auth/handler.go"
-  ],
-  "should_commit": true
+  "scope": null,
+  "subject": "short imperative subject without period",
+  "body": []
 }}
 
-Git context:
-{context}
+Rules:
+- "type" must be one of:
+  feat, fix, docs, style, refactor, perf, test, build, ci, chore
+- "scope" must be a string or null.
+- "subject" must be under 72 characters.
+- "subject" must not end with a period.
+- "body" must be an array of strings.
+- Use the summary and file list first.
+- Use the diff preview only for extra context.
+- Some generated or lockfile paths may appear in summaries but be omitted from the diff preview.
+- If this looks like the first project commit, use type "feat" and subject like "add initial project scaffold".
+
+Repository context:
+
+Branch:
+{}
+
+Git status:
+{}
+
+Diff stat:
+{}
+
+Numstat:
+{}
+
+Changed files:
+{}
+
+Diff preview:
+{}
+
+Return ONLY the JSON object.
 "#,
-    ))
+        changes.branch.output.trim(),
+        changes.status_short.output.trim(),
+        changes.diff_stat.output.trim(),
+        changes.diff_numstat.output.trim(),
+        changes.diff_name_only.output.trim(),
+        changes.diff.output.trim()
+    )
 }

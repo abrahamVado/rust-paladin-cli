@@ -6,30 +6,25 @@ pub struct CommitSuggestion {
     #[serde(rename = "type")]
     pub commit_type: String,
     pub scope: Option<String>,
-    pub title: String,
+    pub subject: String,
     #[serde(default)]
     pub body: Vec<String>,
-    pub risk_level: String,
-    #[serde(default)]
-    pub files: Vec<String>,
-    pub should_commit: bool,
 }
 
 impl CommitSuggestion {
     pub fn validate(&self) -> Result<()> {
         validate_commit_type(&self.commit_type)?;
-        validate_risk_level(&self.risk_level)?;
 
-        if self.title.trim().is_empty() {
-            return Err(anyhow!("commit title is empty"));
+        if self.subject.trim().is_empty() {
+            return Err(anyhow!("commit subject is empty"));
         }
 
-        if self.title.trim().ends_with('.') {
-            return Err(anyhow!("commit title must not end with a period"));
+        if self.subject.trim().ends_with('.') {
+            return Err(anyhow!("commit subject must not end with a period"));
         }
 
-        if self.title.chars().count() > 90 {
-            return Err(anyhow!("commit title is too long"));
+        if self.subject.chars().count() >= 72 {
+            return Err(anyhow!("commit subject must be under 72 characters"));
         }
 
         if let Some(scope) = &self.scope {
@@ -46,11 +41,11 @@ impl CommitSuggestion {
     }
 
     pub fn commit_message(&self) -> String {
-        let title = self.title.trim();
+        let subject = self.subject.trim();
 
         match self.scope.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()) {
-            Some(scope) => format!("{}({}): {}", self.commit_type.trim(), scope, title),
-            None => format!("{}: {}", self.commit_type.trim(), title),
+            Some(scope) => format!("{}({}): {}", self.commit_type.trim(), scope, subject),
+            None => format!("{}: {}", self.commit_type.trim(), subject),
         }
     }
 }
@@ -65,15 +60,5 @@ fn validate_commit_type(value: &str) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("invalid commit type: {}", value))
-    }
-}
-
-fn validate_risk_level(value: &str) -> Result<()> {
-    let allowed = ["low", "medium", "high"];
-
-    if allowed.contains(&value) {
-        Ok(())
-    } else {
-        Err(anyhow!("invalid risk level: {}", value))
     }
 }
