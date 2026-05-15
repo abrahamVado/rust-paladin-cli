@@ -42,6 +42,7 @@ pub struct GitChangeSet {
     pub diff_numstat: CommandResult,
     pub diff_name_only: CommandResult,
     pub diff: CommandResult,
+    pub file_diffs: Vec<FileDiff>,
     pub skipped_diff_paths: Vec<String>,
 
     /// True when the diff came from staged changes:
@@ -51,6 +52,12 @@ pub struct GitChangeSet {
     /// True when the diff was too large and Paladin truncated it
     /// before sending it to the local model.
     pub diff_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileDiff {
+    pub path: String,
+    pub diff: String,
 }
 
 /// Collects the current Git changes.
@@ -86,9 +93,9 @@ pub fn collect_changes(staged: bool, max_diff_chars: usize) -> Result<GitChangeS
     let status_short = run_git(&["status", "--short"])?;
 
     let diff_stat = if use_staged {
-        run_git(&["diff", "--staged", "--stat"])? 
+        run_git(&["diff", "--staged", "--stat"])?
     } else {
-        run_git(&["diff", "--stat"])? 
+        run_git(&["diff", "--stat"])?
     };
 
     let diff_numstat = if use_staged {
@@ -123,6 +130,7 @@ pub fn collect_changes(staged: bool, max_diff_chars: usize) -> Result<GitChangeS
         diff_numstat,
         diff_name_only,
         diff,
+        file_diffs: collect_file_diffs(use_staged)?,
         skipped_diff_paths,
         staged: use_staged,
         diff_truncated,
@@ -134,31 +142,12 @@ pub fn has_changes(changes: &GitChangeSet) -> bool {
     !changes.diff_name_only.output.trim().is_empty()
 }
 
-/// Stages all changes in the repository.
-///
-/// Equivalent to:
-///
-/// ```bash
-/// git add -A
-/// ```
-pub fn stage_all() -> Result<()> {
-    run_git_checked(&["add", "-A"])
-}
+pub fn commit_paths(message: &str, body: &[String], paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Err(anyhow!("cannot create a path-based commit without files"));
+    }
 
-/// Creates a Git commit.
-///
-/// The first `-m` is the commit title.
-/// The second optional `-m` is the commit body.
-///
-/// Example:
-///
-/// ```bash
-/// git commit -m "feat(auth): add JWT refresh token handling" -m "- Add refresh token model
-/// - Store token securely"
-/// ```
-pub fn commit(message: &str, body: &[String]) -> Result<()> {
     let mut args = vec!["commit", "-m", message];
-
     let joined_body;
 
     if !body.is_empty() {
@@ -172,7 +161,47 @@ pub fn commit(message: &str, body: &[String]) -> Result<()> {
         args.push(joined_body.as_str());
     }
 
+    args.push("--");
+
+    for path in paths {
+        args.push(path.as_str());
+    }
+
     run_git_checked(&args)
+}
+
+fn collect_file_diffs(staged: bool) -> Result<Vec<FileDiff>> {
+    let diff_name_only = if staged {
+        run_git(&["diff", "--staged", "--name-only"])?
+    } else {
+        run_git(&["diff", "--name-only"])?
+    };
+
+    let mut files = Vec::new();
+
+    for path in diff_name_only
+        .output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if should_skip_diff_path(path) {
+            continue;
+        }
+
+        let diff = if staged {
+            run_git(&["diff", "--staged", "--", path])?
+        } else {
+            run_git(&["diff", "--", path])?
+        };
+
+        files.push(FileDiff {
+            path: path.to_string(),
+            diff: diff.output,
+        });
+    }
+
+    Ok(files)
 }
 
 /// Ensures the current directory is inside a Git repository.
@@ -240,7 +269,12 @@ fn collect_excluded_paths(staged: bool) -> Result<Vec<String>> {
 
     let mut excluded_paths = Vec::new();
 
-    for path in diff_name_only.output.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    for path in diff_name_only
+        .output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         if should_skip_diff_path(path) {
             excluded_paths.push(path.to_string());
         }
@@ -276,8 +310,12 @@ fn should_skip_diff_path(path: &str) -> bool {
 
 fn is_path_in_dir(path: &str, dir: &str) -> bool {
     path == dir
-        || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'))
-        || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('\\'))
+        || path
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/'))
+        || path
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('\\'))
 }
 
 /// Runs a Git command and fails if Git returns a non-zero status.
