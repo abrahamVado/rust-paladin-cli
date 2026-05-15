@@ -10,6 +10,8 @@ pub struct CommitSuggestion {
     #[serde(default)]
     pub body: Vec<String>,
     pub risk: String,
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 impl CommitSuggestion {
@@ -39,15 +41,40 @@ impl CommitSuggestion {
             }
         }
 
+        if self.files.is_empty() {
+            return Err(anyhow!("commit must include at least one file"));
+        }
+
         Ok(())
     }
 
     pub fn commit_message(&self) -> String {
         let subject = self.subject.trim();
 
-        match self.scope.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()) {
+        match self
+            .scope
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
             Some(scope) => format!("{}({}): {}", self.commit_type.trim(), scope, subject),
             None => format!("{}: {}", self.commit_type.trim(), subject),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitPlan {
+    #[serde(default)]
+    pub strategy: String,
+    pub commits: Vec<CommitSuggestion>,
+}
+
+impl CommitPlan {
+    pub fn from_commits(strategy: impl Into<String>, commits: Vec<CommitSuggestion>) -> Self {
+        Self {
+            strategy: strategy.into(),
+            commits,
         }
     }
 }
