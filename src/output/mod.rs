@@ -1,3 +1,3 @@
 pub mod printer;
 
-pub use printer::print_commit_suggestion;
+pub use printer::print_commit_plan;
