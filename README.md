@@ -1,13 +1,15 @@
 # Paladin
 
-A local Rust CLI that uses a local Ollama model, for example `gemma4:e4b`, to generate conventional Git commits from your current diff.
+A local Rust CLI that uses a local Ollama model, for example `gemma4:e4b`, to generate a conventional commit plan from your current diff.
 
 Paladin is designed to be safe:
 
 - The model does not run shell commands.
 - Rust runs `git` commands directly.
-- `commit` always previews the suggested commit.
-- `commit` asks for confirmation before creating a commit.
+- `commit` previews the suggested commit plan in a TUI by default.
+- `commit` can split large or mixed changes into multiple themed commits.
+- `commit` retries when the model returns invalid JSON.
+- `commit` asks for confirmation before creating any commit.
 - The model must return JSON, which Paladin validates before use.
 
 ## Requirements
@@ -41,7 +43,7 @@ Binary:
 
 ## Usage
 
-Create a commit after preview and confirmation:
+Create a commit plan after preview and confirmation:
 
 ```bash
 paladin commit
@@ -69,6 +71,18 @@ Disable confirmation:
 
 ```bash
 paladin commit --yes
+```
+
+Disable the interactive preview:
+
+```bash
+paladin commit --no-tui
+```
+
+Allow more commit groups for large changes:
+
+```bash
+paladin commit --max-commits 7
 ```
 
 ## What Paladin runs
@@ -102,16 +116,29 @@ paladin commit
 Output:
 
 ```text
-Suggested commit:
+Suggested commit plan:
+Split auth logic from CLI wiring so each commit stays reviewable.
+
+Commit 1
 feat(auth): wire login flow to database
 
 Body:
 - validate credentials using stored bcrypt hashes
 - return an access token after successful authentication
 
-Risk: medium
+Files:
+- src/auth.rs
+- src/db.rs
+
+Commit 2
+refactor(cli): simplify login command flow
+
+Files:
+- src/cli.rs
 ```
 
 ## Notes
 
 For very large diffs, Paladin truncates the diff before sending it to the local model. This keeps the small model from getting overloaded.
+
+Commit splitting is file-based. Paladin can group related files into separate commits, but it does not try to split multiple themes inside the same file into different commits.
