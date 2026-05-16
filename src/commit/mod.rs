@@ -256,6 +256,7 @@ fn apply_commit_plan(plan: &CommitPlan) -> Result<()> {
             }
         }
 
+        git::add_paths(&commit.files)?;
         git::commit_paths(&commit.commit_message(), &commit.body, &commit.files)?;
     }
 
