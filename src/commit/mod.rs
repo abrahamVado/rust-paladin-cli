@@ -18,7 +18,7 @@ use ratatui::{
 };
 use schema::{CommitPlan, CommitSuggestion};
 use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
 pub async fn run(args: CommitArgs) -> Result<()> {
@@ -37,8 +37,21 @@ pub async fn run(args: CommitArgs) -> Result<()> {
 
     if args.no_tui {
         output::print_commit_plan(&plan, changes.diff_truncated);
+    } else if !io::stdout().is_terminal() {
+        println!("Interactive preview unavailable because stdout is not a terminal.");
+        output::print_commit_plan(&plan, changes.diff_truncated);
     } else {
-        preview_commit_plan_tui(&plan, changes.diff_truncated)?;
+        println!("Opening interactive commit preview...");
+        println!("Use arrow keys to switch commits, then press Enter to continue.");
+
+        if let Err(error) = preview_commit_plan_tui(&plan, changes.diff_truncated) {
+            println!("Interactive preview unavailable: {error}");
+            println!("Falling back to plain-text preview.");
+        }
+
+        println!();
+        println!("Commit preview summary:");
+        output::print_commit_plan(&plan, changes.diff_truncated);
     }
 
     if !args.yes && !confirm("Create these commit(s)? [y/N] ")? {

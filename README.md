@@ -49,6 +49,8 @@ Create a commit plan after preview and confirmation:
 paladin commit
 ```
 
+This opens an interactive terminal preview when possible. If your terminal does not support it, Paladin now falls back to a plain-text preview automatically.
+
 Use only staged changes:
 
 ```bash
