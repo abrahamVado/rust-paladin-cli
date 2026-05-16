@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const EXCLUDED_DIFF_PATHS: &[&str] = &[
@@ -139,7 +141,20 @@ pub fn collect_changes(staged: bool, max_diff_chars: usize) -> Result<GitChangeS
 
 /// Returns true when Paladin has an actual diff to send to the model.
 pub fn has_changes(changes: &GitChangeSet) -> bool {
-    !changes.diff_name_only.output.trim().is_empty()
+    !changes.file_diffs.is_empty() || !changes.status_short.output.trim().is_empty()
+}
+
+pub fn add_paths(paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let mut args = vec!["add", "--"];
+    for path in paths {
+        args.push(path.as_str());
+    }
+
+    run_git_checked(&args)
 }
 
 pub fn commit_paths(message: &str, body: &[String], paths: &[String]) -> Result<()> {
@@ -171,33 +186,27 @@ pub fn commit_paths(message: &str, body: &[String], paths: &[String]) -> Result<
 }
 
 fn collect_file_diffs(staged: bool) -> Result<Vec<FileDiff>> {
-    let diff_name_only = if staged {
-        run_git(&["diff", "--staged", "--name-only"])?
-    } else {
-        run_git(&["diff", "--name-only"])?
-    };
-
     let mut files = Vec::new();
 
-    for path in diff_name_only
-        .output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        if should_skip_diff_path(path) {
+    for entry in collect_changed_entries(staged)? {
+        if should_skip_diff_path(&entry.path) {
             continue;
         }
 
-        let diff = if staged {
-            run_git(&["diff", "--staged", "--", path])?
-        } else {
-            run_git(&["diff", "--", path])?
+        let diff = match entry.kind {
+            ChangeKind::Untracked => build_untracked_file_diff(&entry.path)?,
+            ChangeKind::Tracked => {
+                if staged {
+                    run_git(&["diff", "--staged", "--", &entry.path])?.output
+                } else {
+                    run_git(&["diff", "--", &entry.path])?.output
+                }
+            }
         };
 
         files.push(FileDiff {
-            path: path.to_string(),
-            diff: diff.output,
+            path: entry.path,
+            diff,
         });
     }
 
@@ -261,26 +270,150 @@ fn run_git_filtered_diff(staged: bool) -> Result<(CommandResult, Vec<String>)> {
 }
 
 fn collect_excluded_paths(staged: bool) -> Result<Vec<String>> {
-    let diff_name_only = if staged {
-        run_git(&["diff", "--staged", "--name-only"])?
-    } else {
-        run_git(&["diff", "--name-only"])?
-    };
-
     let mut excluded_paths = Vec::new();
 
-    for path in diff_name_only
-        .output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        if should_skip_diff_path(path) {
-            excluded_paths.push(path.to_string());
+    for entry in collect_changed_entries(staged)? {
+        if should_skip_diff_path(&entry.path) {
+            excluded_paths.push(entry.path);
         }
     }
 
     Ok(excluded_paths)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ChangeKind {
+    Tracked,
+    Untracked,
+}
+
+#[derive(Debug, Clone)]
+struct ChangedEntry {
+    path: String,
+    kind: ChangeKind,
+}
+
+fn collect_changed_entries(staged: bool) -> Result<Vec<ChangedEntry>> {
+    if staged {
+        let diff_name_only = run_git(&["diff", "--staged", "--name-only"])?;
+        return Ok(diff_name_only
+            .output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|path| ChangedEntry {
+                path: path.to_string(),
+                kind: ChangeKind::Tracked,
+            })
+            .collect());
+    }
+
+    let status_short = run_git(&["status", "--short"])?;
+    let mut entries = Vec::new();
+
+    for raw_line in status_short.output.lines() {
+        let line = raw_line.trim_end();
+        if line.is_empty() || line.len() < 4 {
+            continue;
+        }
+
+        let status = &line[..2];
+        let path = line[3..]
+            .split(" -> ")
+            .last()
+            .map(str::trim)
+            .unwrap_or_default();
+
+        if path.is_empty() {
+            continue;
+        }
+
+        if status == "??" {
+            entries.extend(expand_untracked_path(path)?);
+        } else {
+            entries.push(ChangedEntry {
+                path: path.to_string(),
+                kind: ChangeKind::Tracked,
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+fn expand_untracked_path(path: &str) -> Result<Vec<ChangedEntry>> {
+    let path_buf = PathBuf::from(path);
+    let metadata = fs::metadata(&path_buf)
+        .with_context(|| format!("failed to inspect untracked path `{}`", path))?;
+
+    if metadata.is_file() {
+        return Ok(vec![ChangedEntry {
+            path: normalize_git_path(&path_buf),
+            kind: ChangeKind::Untracked,
+        }]);
+    }
+
+    if metadata.is_dir() {
+        let mut entries = Vec::new();
+        collect_untracked_dir_entries(&path_buf, &mut entries)?;
+        return Ok(entries);
+    }
+
+    Ok(Vec::new())
+}
+
+fn collect_untracked_dir_entries(dir: &Path, entries: &mut Vec<ChangedEntry>) -> Result<()> {
+    for child in fs::read_dir(dir)
+        .with_context(|| format!("failed to read untracked directory `{}`", dir.display()))?
+    {
+        let child = child?;
+        let child_path = child.path();
+        let metadata = child
+            .metadata()
+            .with_context(|| format!("failed to inspect `{}`", child_path.display()))?;
+
+        if metadata.is_dir() {
+            collect_untracked_dir_entries(&child_path, entries)?;
+        } else if metadata.is_file() {
+            entries.push(ChangedEntry {
+                path: normalize_git_path(&child_path),
+                kind: ChangeKind::Untracked,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_git_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn build_untracked_file_diff(path: &str) -> Result<String> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read untracked file `{}`", path))?;
+    let mut diff = format!("diff --git a/{0} b/{0}\nnew file mode 100644\n", path);
+    diff.push_str("--- /dev/null\n");
+    diff.push_str(&format!("+++ b/{}\n", path));
+    diff.push_str("@@ -0,0 +1 @@\n");
+
+    if contents.is_empty() {
+        diff.push_str("+[empty file]\n");
+    } else {
+        for line in contents.lines() {
+            diff.push('+');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+
+        if contents.ends_with('\n') {
+            // already represented by iterating lines and explicit newlines above
+        } else {
+            diff.push_str("\\ No newline at end of file\n");
+        }
+    }
+
+    Ok(diff)
 }
 
 fn should_skip_diff_path(path: &str) -> bool {
@@ -316,6 +449,49 @@ fn is_path_in_dir(path: &str, dir: &str) -> bool {
         || path
             .strip_prefix(dir)
             .is_some_and(|rest| rest.starts_with('\\'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn expand_untracked_path_returns_nested_files_for_directories() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("paladin-untracked-{unique}"));
+        let nested_dir = root.join("internal").join("modules").join("apikeys");
+        fs::create_dir_all(&nested_dir).unwrap();
+
+        let top_level = nested_dir.join("handler.go");
+        let nested = nested_dir.join("repo").join("store.go");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&top_level, "package apikeys\n").unwrap();
+        fs::write(&nested, "package repo\n").unwrap();
+
+        let previous_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+
+        let result = expand_untracked_path("internal/modules/apikeys/").unwrap();
+
+        std::env::set_current_dir(previous_dir).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        let paths = result
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "internal/modules/apikeys/handler.go".to_string(),
+                "internal/modules/apikeys/repo/store.go".to_string()
+            ]
+        );
+    }
 }
 
 /// Runs a Git command and fails if Git returns a non-zero status.
