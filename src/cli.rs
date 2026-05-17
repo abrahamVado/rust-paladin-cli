@@ -49,12 +49,16 @@ pub struct CommitArgs {
     pub max_commits: usize,
 
     /// Maximum changed files sent in a single model request.
-    #[arg(long, default_value_t = 6)]
+    #[arg(long, default_value_t = 3)]
     pub max_files_per_batch: usize,
 
     /// Maximum diff characters sent in a single model request batch.
-    #[arg(long, default_value_t = 8_000)]
+    #[arg(long, default_value_t = 4_000)]
     pub max_batch_chars: usize,
+
+    /// Maximum diff characters from any single file included in a model request.
+    #[arg(long, default_value_t = 1_500)]
+    pub max_file_diff_chars: usize,
 
     /// Retry attempts when the model returns invalid JSON.
     #[arg(long, default_value_t = 2)]

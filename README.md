@@ -8,6 +8,8 @@ Paladin is designed to be safe:
 - Rust runs `git` commands directly.
 - `commit` previews the suggested commit plan in a TUI by default.
 - `commit` can split large or mixed changes into multiple themed commits.
+- `commit` sends smaller file batches to the model instead of one large diff blob.
+- `commit` does a final whole-plan review so the model can check all parts together.
 - `commit` retries when the model returns invalid JSON.
 - `commit` asks for confirmation before creating any commit.
 - The model must return JSON, which Paladin validates before use.
@@ -87,6 +89,12 @@ Allow more commit groups for large changes:
 paladin commit --max-commits 7
 ```
 
+Use smaller model requests for weaker local models:
+
+```bash
+paladin commit --max-files-per-batch 2 --max-batch-chars 2500 --max-file-diff-chars 900
+```
+
 ## What Paladin runs
 
 Depending on flags:
@@ -141,6 +149,6 @@ Files:
 
 ## Notes
 
-For very large diffs, Paladin truncates the diff before sending it to the local model. This keeps the small model from getting overloaded.
+For very large diffs, Paladin truncates the diff before sending it to the local model. It also limits how much of any single file diff is included in one request. This keeps smaller local models from getting overloaded.
 
 Commit splitting is file-based. Paladin can group related files into separate commits, but it does not try to split multiple themes inside the same file into different commits.
