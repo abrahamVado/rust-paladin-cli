@@ -20,6 +20,7 @@ use schema::{CommitPlan, CommitSuggestion};
 use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
+use serde_json::{Map, Value};
 
 pub async fn run(args: CommitArgs) -> Result<()> {
     let changes = git::collect_changes(args.staged, args.max_diff_chars)?;
@@ -129,7 +130,7 @@ async fn generate_single_commit(
                 attempt += 1;
                 let last_error = error.to_string();
                 current_prompt = format!(
-                    "{prompt}\n\nYour previous reply was invalid.\nValidation error: {last_error}\nReturn corrected JSON only.\nDo not return tool calls.\nPrevious invalid reply:\n{raw_response}"
+                    "{prompt}\n\nYour previous reply was invalid.\nValidation error: {last_error}\nFix your previous reply by returning exactly one JSON object matching the required schema.\nDo not explain the mistake.\nDo not ask questions.\nDo not return markdown.\nDo not return tool calls.\nIf your previous reply used an `error` field, discard it and infer the best commit suggestion from the diff.\nPrevious invalid reply:\n{raw_response}"
                 );
             }
         }
@@ -158,7 +159,7 @@ async fn generate_batched_commit_plan(
     let mut commits = Vec::with_capacity(total_batches);
 
     for (index, batch) in capped_batches.iter().enumerate() {
-        let prompt = prompt::build_batch_commit_prompt(batch);
+        let prompt = prompt::build_batch_commit_prompt(batch, args.max_file_diff_chars);
         let batch_files = batch
             .iter()
             .map(|file| file.path.clone())
@@ -174,22 +175,244 @@ async fn generate_batched_commit_plan(
         commits.push(commit);
     }
 
-    Ok(CommitPlan::from_commits(
+    let initial_plan = CommitPlan::from_commits(
         format!(
             "Generated {} smaller commit batch(es) locally to keep model requests short.",
             commits.len()
         ),
         commits,
-    ))
+    );
+
+    refine_commit_plan(args, initial_plan).await
+}
+
+async fn refine_commit_plan(args: &CommitArgs, initial_plan: CommitPlan) -> Result<CommitPlan> {
+    if initial_plan.commits.len() <= 1 {
+        return Ok(initial_plan);
+    }
+
+    println!(
+        "Reviewing all {} commit part(s) together for a final plan...",
+        initial_plan.commits.len()
+    );
+
+    let prompt =
+        prompt::build_plan_review_prompt(&initial_plan.commits, args.max_files_per_batch);
+    let allowed_files = initial_plan
+        .commits
+        .iter()
+        .flat_map(|commit| commit.files.iter().cloned())
+        .collect::<Vec<_>>();
+    let primary = OllamaClient::new(args.ollama_url.clone(), args.model.clone());
+
+    match generate_finalized_plan(&primary, &prompt, &allowed_files, args.retries).await {
+        Ok(plan) => Ok(plan),
+        Err(primary_error) => {
+            let Some(fallback_model) = args.fallback_model.clone() else {
+                return Ok(initial_plan);
+            };
+
+            let is_load_error = primary_error
+                .downcast_ref::<OllamaGenerateError>()
+                .is_some_and(|error| matches!(error, OllamaGenerateError::ModelLoadFailure { .. }));
+
+            if !is_load_error {
+                return Ok(initial_plan);
+            }
+
+            println!(
+                "Primary model `{}` failed to load during final plan review. Retrying with fallback model `{}`...",
+                args.model, fallback_model
+            );
+
+            let fallback = OllamaClient::new(args.ollama_url.clone(), fallback_model);
+            generate_finalized_plan(&fallback, &prompt, &allowed_files, args.retries)
+                .await
+                .or(Ok(initial_plan))
+        }
+    }
+}
+
+async fn generate_finalized_plan(
+    client: &OllamaClient,
+    prompt: &str,
+    allowed_files: &[String],
+    retries: usize,
+) -> Result<CommitPlan> {
+    let mut attempt = 0usize;
+    let mut current_prompt = prompt.to_string();
+
+    loop {
+        let raw_response = client.generate_json(&current_prompt).await?;
+
+        match parse_commit_plan(&raw_response, allowed_files) {
+            Ok(plan) => return Ok(plan),
+            Err(error) => {
+                if attempt >= retries {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "model did not return a valid final commit plan after {} attempt(s)\nlast response:\n{}",
+                            attempt + 1,
+                            raw_response
+                        )
+                    });
+                }
+
+                attempt += 1;
+                let last_error = error.to_string();
+                current_prompt = format!(
+                    "{prompt}\n\nYour previous reply was invalid.\nValidation error: {last_error}\nFix your previous reply by returning exactly one JSON object matching the required schema.\nDo not explain the mistake.\nDo not ask questions.\nDo not return markdown.\nDo not return tool calls.\nEvery allowed file must appear exactly once.\nPrevious invalid reply:\n{raw_response}"
+                );
+            }
+        }
+    }
 }
 
 fn parse_commit_suggestion(raw_response: &str, batch_files: &[String]) -> Result<CommitSuggestion> {
     let extracted = extract_json_block(raw_response).unwrap_or(raw_response);
-    let mut suggestion: CommitSuggestion = serde_json::from_str(extracted)
+    let mut suggestion = parse_commit_suggestion_value(extracted)
+        .or_else(|_| parse_commit_suggestion_value(raw_response))
         .with_context(|| format!("failed to parse commit suggestion JSON:\n{}", raw_response))?;
     suggestion.files = batch_files.to_vec();
     suggestion.validate()?;
     Ok(suggestion)
+}
+
+fn parse_commit_plan(raw_response: &str, allowed_files: &[String]) -> Result<CommitPlan> {
+    let extracted = extract_json_block(raw_response).unwrap_or(raw_response);
+    let plan = serde_json::from_str::<CommitPlan>(extracted)
+        .or_else(|_| serde_json::from_str::<CommitPlan>(raw_response))
+        .with_context(|| format!("failed to parse final commit plan JSON:\n{}", raw_response))?;
+    plan.validate()?;
+    validate_plan_files(&plan, allowed_files)?;
+    Ok(plan)
+}
+
+fn validate_plan_files(plan: &CommitPlan, allowed_files: &[String]) -> Result<()> {
+    let expected = allowed_files.iter().cloned().collect::<HashSet<_>>();
+    let actual = plan
+        .commits
+        .iter()
+        .flat_map(|commit| commit.files.iter().cloned())
+        .collect::<HashSet<_>>();
+
+    if actual != expected {
+        let missing = expected
+            .difference(&actual)
+            .cloned()
+            .collect::<Vec<_>>();
+        let unexpected = actual
+            .difference(&expected)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        return Err(anyhow!(
+            "final commit plan changed the file set; missing: [{}], unexpected: [{}]",
+            missing.join(", "),
+            unexpected.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
+fn parse_commit_suggestion_value(value: &str) -> Result<CommitSuggestion> {
+    let parsed: Value = serde_json::from_str(value)?;
+    parse_commit_suggestion_json(&parsed)
+}
+
+fn parse_commit_suggestion_json(value: &Value) -> Result<CommitSuggestion> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("commit suggestion must be a JSON object"))?;
+
+    if let Ok(suggestion) = serde_json::from_value::<CommitSuggestion>(value.clone()) {
+        return Ok(suggestion);
+    }
+
+    if let Some(nested) = find_nested_suggestion(object) {
+        if let Ok(suggestion) = serde_json::from_value::<CommitSuggestion>(nested.clone()) {
+            return Ok(suggestion);
+        }
+    }
+
+    normalize_commit_suggestion(object)
+}
+
+fn find_nested_suggestion(object: &Map<String, Value>) -> Option<&Value> {
+    ["commit", "suggestion", "result", "output", "data"]
+        .into_iter()
+        .find_map(|key| object.get(key))
+}
+
+fn normalize_commit_suggestion(object: &Map<String, Value>) -> Result<CommitSuggestion> {
+    let commit_type = read_string_alias(object, &["type", "commit_type", "kind"])
+        .ok_or_else(|| anyhow!("missing required field `type`"))?;
+    let subject = read_string_alias(object, &["subject", "title", "message", "summary"])
+        .ok_or_else(|| anyhow!("missing required field `subject`"))?;
+    let risk = read_string_alias(object, &["risk", "risk_level", "impact"])
+        .unwrap_or_else(|| "medium".to_string());
+    let scope = read_optional_string_alias(object, &["scope", "area"]);
+    let body = read_body_alias(object, &["body", "details", "description", "bullets"]);
+
+    Ok(CommitSuggestion {
+        commit_type,
+        scope,
+        subject,
+        body,
+        risk,
+        files: Vec::new(),
+    })
+}
+
+fn read_string_alias(object: &Map<String, Value>, aliases: &[&str]) -> Option<String> {
+    aliases.iter().find_map(|alias| {
+        object.get(*alias).and_then(|value| match value {
+            Value::String(text) => {
+                let trimmed = text.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            }
+            _ => None,
+        })
+    })
+}
+
+fn read_optional_string_alias(object: &Map<String, Value>, aliases: &[&str]) -> Option<String> {
+    aliases.iter().find_map(|alias| {
+        object.get(*alias).and_then(|value| match value {
+            Value::Null => None,
+            Value::String(text) => {
+                let trimmed = text.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            }
+            _ => None,
+        })
+    })
+}
+
+fn read_body_alias(object: &Map<String, Value>, aliases: &[&str]) -> Vec<String> {
+    aliases
+        .iter()
+        .find_map(|alias| object.get(*alias))
+        .map(|value| match value {
+            Value::Array(items) => items
+                .iter()
+                .filter_map(|item| match item {
+                    Value::String(text) => {
+                        let trimmed = text.trim();
+                        (!trimmed.is_empty()).then(|| trimmed.to_string())
+                    }
+                    _ => None,
+                })
+                .collect(),
+            Value::String(text) => text
+                .lines()
+                .map(|line| line.trim().trim_start_matches("- ").to_string())
+                .filter(|line| !line.is_empty())
+                .collect(),
+            _ => Vec::new(),
+        })
+        .unwrap_or_default()
 }
 
 fn extract_json_block(value: &str) -> Option<&str> {
@@ -247,15 +470,9 @@ fn testing_hint(primary_model: &str, fallback_model: Option<&str>) -> String {
 }
 
 fn apply_commit_plan(plan: &CommitPlan) -> Result<()> {
-    let mut seen = HashSet::new();
+    plan.validate()?;
 
     for commit in &plan.commits {
-        for path in &commit.files {
-            if !seen.insert(path.clone()) {
-                return Err(anyhow!("duplicate file in applied plan: {}", path));
-            }
-        }
-
         git::add_paths(&commit.files)?;
         git::commit_paths(&commit.commit_message(), &commit.body, &commit.files)?;
     }
@@ -399,4 +616,62 @@ fn render_plan(frame: &mut Frame<'_>, plan: &CommitPlan, selected: usize, diff_t
     let footer =
         Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL).title("Controls"));
     frame.render_widget(footer, areas[2]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_commit_plan, parse_commit_suggestion};
+
+    #[test]
+    fn parses_standard_commit_suggestion() {
+        let raw = r#"{"type":"fix","scope":null,"subject":"handle parser retry prompt","body":["tighten retry instructions"],"risk":"low"}"#;
+        let suggestion = parse_commit_suggestion(raw, &[String::from("src/commit/mod.rs")]).unwrap();
+
+        assert_eq!(suggestion.commit_type, "fix");
+        assert_eq!(suggestion.subject, "handle parser retry prompt");
+        assert_eq!(suggestion.risk, "low");
+        assert_eq!(suggestion.files, vec![String::from("src/commit/mod.rs")]);
+    }
+
+    #[test]
+    fn parses_nested_commit_suggestion() {
+        let raw = r#"{"result":{"type":"docs","scope":"readme","subject":"clarify commit json output","body":["show a valid example"],"risk":"low"}}"#;
+        let suggestion = parse_commit_suggestion(raw, &[String::from("README.md")]).unwrap();
+
+        assert_eq!(suggestion.commit_type, "docs");
+        assert_eq!(suggestion.scope.as_deref(), Some("readme"));
+        assert_eq!(suggestion.subject, "clarify commit json output");
+    }
+
+    #[test]
+    fn parses_final_commit_plan_with_expected_files() {
+        let raw = r#"{
+          "strategy":"group related auth and docs changes separately",
+          "commits":[
+            {
+              "type":"fix",
+              "scope":"auth",
+              "subject":"handle login retry flow",
+              "body":["keep auth changes together"],
+              "risk":"medium",
+              "files":["src/auth.rs"]
+            },
+            {
+              "type":"docs",
+              "scope":"readme",
+              "subject":"document login retry behavior",
+              "body":[],
+              "risk":"low",
+              "files":["README.md"]
+            }
+          ]
+        }"#;
+
+        let plan = parse_commit_plan(raw, &[String::from("src/auth.rs"), String::from("README.md")])
+            .unwrap();
+
+        assert_eq!(plan.commits.len(), 2);
+        assert_eq!(plan.commits[0].commit_type, "fix");
+        assert_eq!(plan.commits[1].commit_type, "docs");
+    }
 }

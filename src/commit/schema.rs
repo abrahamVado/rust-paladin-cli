@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitSuggestion {
@@ -76,6 +77,26 @@ impl CommitPlan {
             strategy: strategy.into(),
             commits,
         }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.commits.is_empty() {
+            return Err(anyhow!("commit plan must include at least one commit"));
+        }
+
+        let mut seen = HashSet::new();
+
+        for commit in &self.commits {
+            commit.validate()?;
+
+            for path in &commit.files {
+                if !seen.insert(path.clone()) {
+                    return Err(anyhow!("duplicate file in commit plan: {}", path));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
