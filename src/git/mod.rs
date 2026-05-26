@@ -346,6 +346,10 @@ fn expand_untracked_path(path: &str) -> Result<Vec<ChangedEntry>> {
     let metadata = fs::metadata(&path_buf)
         .with_context(|| format!("failed to inspect untracked path `{}`", path))?;
 
+    if is_ignored_path(&path_buf)? {
+        return Ok(Vec::new());
+    }
+
     if metadata.is_file() {
         return Ok(vec![ChangedEntry {
             path: normalize_git_path(&path_buf),
@@ -372,6 +376,10 @@ fn collect_untracked_dir_entries(dir: &Path, entries: &mut Vec<ChangedEntry>) ->
             .metadata()
             .with_context(|| format!("failed to inspect `{}`", child_path.display()))?;
 
+        if is_ignored_path(&child_path)? {
+            continue;
+        }
+
         if metadata.is_dir() {
             collect_untracked_dir_entries(&child_path, entries)?;
         } else if metadata.is_file() {
@@ -385,16 +393,44 @@ fn collect_untracked_dir_entries(dir: &Path, entries: &mut Vec<ChangedEntry>) ->
     Ok(())
 }
 
+fn is_ignored_path(path: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["check-ignore", "-q", "--"])
+        .arg(path)
+        .output()
+        .with_context(|| format!("failed to run `git check-ignore` for `{}`", path.display()))?;
+
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(anyhow!(
+            "`git check-ignore` failed for `{}`:\n{}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )),
+    }
+}
+
 fn normalize_git_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
 fn build_untracked_file_diff(path: &str) -> Result<String> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read untracked file `{}`", path))?;
     let mut diff = format!("diff --git a/{0} b/{0}\nnew file mode 100644\n", path);
     diff.push_str("--- /dev/null\n");
     diff.push_str(&format!("+++ b/{}\n", path));
+
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read untracked file `{}`", path))?;
+    let contents = match String::from_utf8(bytes) {
+        Ok(contents) => contents,
+        Err(_) => {
+            diff.push_str("@@ -0,0 +1 @@\n");
+            diff.push_str("+[binary file omitted]\n");
+            return Ok(diff);
+        }
+    };
+
     diff.push_str("@@ -0,0 +1 @@\n");
 
     if contents.is_empty() {
@@ -442,22 +478,30 @@ fn should_skip_diff_path(path: &str) -> bool {
 }
 
 fn is_path_in_dir(path: &str, dir: &str) -> bool {
-    path == dir
-        || path
-            .strip_prefix(dir)
-            .is_some_and(|rest| rest.starts_with('/'))
-        || path
-            .strip_prefix(dir)
-            .is_some_and(|rest| rest.starts_with('\\'))
+    let path_parts = split_path_parts(path);
+    let dir_parts = split_path_parts(dir);
+
+    !dir_parts.is_empty()
+        && path_parts
+            .windows(dir_parts.len())
+            .any(|parts| parts == dir_parts.as_slice())
+}
+
+fn split_path_parts(path: &str) -> Vec<&str> {
+    path.split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn expand_untracked_path_returns_nested_files_for_directories() {
+        let _guard = cwd_lock().lock().unwrap();
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -474,6 +518,7 @@ mod tests {
 
         let previous_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(&root).unwrap();
+        run_test_git(&["init"]).unwrap();
 
         let result = expand_untracked_path("internal/modules/apikeys/").unwrap();
 
@@ -491,6 +536,103 @@ mod tests {
                 "internal/modules/apikeys/repo/store.go".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn skips_generated_directories_below_project_roots() {
+        assert!(should_skip_diff_path(
+            "frontend/.next/cache/webpack/server-development/index.pack.gz.old"
+        ));
+        assert!(should_skip_diff_path("app/public/build/manifest.json"));
+        assert!(should_skip_diff_path("service/node_modules/pkg/index.js"));
+        assert!(!should_skip_diff_path("src/build.rs"));
+        assert!(!should_skip_diff_path("src/next/page.tsx"));
+    }
+
+    #[test]
+    fn untracked_binary_file_diff_does_not_require_utf8() {
+        let _guard = cwd_lock().lock().unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("paladin-binary-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let binary_path = root.join("asset.bin");
+        fs::write(&binary_path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let previous_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+
+        let diff = build_untracked_file_diff("asset.bin").unwrap();
+
+        std::env::set_current_dir(previous_dir).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert!(diff.contains("+[binary file omitted]"));
+    }
+
+    #[test]
+    fn expand_untracked_path_skips_gitignored_children() {
+        let _guard = cwd_lock().lock().unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("paladin-ignore-{unique}"));
+        fs::create_dir_all(root.join("frontend").join(".next").join("cache")).unwrap();
+        fs::write(root.join(".gitignore"), ".next/\n*.log\n").unwrap();
+        fs::write(
+            root.join("frontend").join("page.tsx"),
+            "export default Page;\n",
+        )
+        .unwrap();
+        fs::write(root.join("frontend").join("debug.log"), "debug\n").unwrap();
+        fs::write(
+            root.join("frontend")
+                .join(".next")
+                .join("cache")
+                .join("index.pack.gz.old"),
+            [0xff, 0xfe, 0xfd],
+        )
+        .unwrap();
+
+        let previous_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        run_test_git(&["init"]).unwrap();
+
+        let result = expand_untracked_path("frontend/").unwrap();
+
+        std::env::set_current_dir(previous_dir).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        let paths = result
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["frontend/page.tsx".to_string()]);
+    }
+
+    fn run_test_git(args: &[&str]) -> Result<()> {
+        let output = Command::new("git")
+            .args(args)
+            .output()
+            .with_context(|| format!("failed to run test git {}", args.join(" ")))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "test git {} failed:\n{}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
+    fn cwd_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
 }
 
